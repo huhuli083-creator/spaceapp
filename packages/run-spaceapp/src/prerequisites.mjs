@@ -128,7 +128,7 @@ export async function detectContainerEngine({
   if (candidate === "docker" || candidate === "podman") {
     return candidate;
   }
-  if (await dockerCliAndComposeAreAvailable(execute)) {
+  if (await dockerIsReady(execute)) {
     return "docker";
   }
   if (await podmanCliAndComposeAreAvailable(execute)) {

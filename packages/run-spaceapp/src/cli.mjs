@@ -1211,6 +1211,22 @@ async function planInteractiveSetup({
     };
   }
 
+  const existingEngine = rawExisting?.engine ?? "docker";
+  const requestedEngineOverride =
+    parsed.requestedEngine ??
+    stdin?._spaceappPromptController?.answers?.engine ??
+    env?.SPACEAPP_CONTAINER_ENGINE;
+  if (
+    rawExisting &&
+    requestedEngineOverride &&
+    requestedEngineOverride !== "auto" &&
+    requestedEngineOverride !== existingEngine
+  ) {
+    throw new Error(
+      `Cannot switch container engine from ${existingEngine} to ${requestedEngineOverride} on an existing installation because container volumes are not visible across engines. Run "${UNIVERSAL_COMMAND} backup", uninstall, and restore on ${requestedEngineOverride}.`
+    );
+  }
+
   if (path === "same" && !hasRequestedConfigChange(rawExisting, parsed)) {
     const choice = await promptChoice(stdin, stdout, `SpaceApp ${rawExisting.version} is already installed. What would you like to do?`, [
       { label: "Run doctor diagnostics (read-only)", value: "doctor" },
@@ -2245,6 +2261,7 @@ async function supportBundleCommand({
         ? {
             version: config.version,
             profile: config.profile,
+            engine: config.engine,
             accessMode: config.accessMode,
             companionsEnabled: config.companionsEnabled,
             bindHost: config.bindHost,
@@ -2335,7 +2352,10 @@ async function factoryResetCommand({
     await rm(join(root, "compose.yml"), { force: true });
   } catch {}
 
-  const result = await initializeInstallation(root, { version: runtimeVersion });
+  const result = await initializeInstallation(root, {
+    version: runtimeVersion,
+    ...(config.engine !== undefined ? { engine: config.engine } : {})
+  });
   stdout.write(`SpaceApp factory reset complete. Clean installation initialized at ${root}\n`);
   if (result.setupToken) {
     stdout.write(`One-time setup token: ${result.setupToken}\n`);
@@ -2536,9 +2556,9 @@ async function doctor({
     (check.ok ? stdout : stderr).write(`${check.ok ? "PASS" : "FAIL"} ${check.name}: ${check.detail}\n`);
   }
   if (dockerCli.code !== 0 || dockerCompose.code !== 0) {
-    stderr.write(`${dockerInstallHelp(platform)}\n`);
+    stderr.write(`${dockerInstallHelp(platform, doctorEngine)}\n`);
   } else if (dockerEngine.code !== 0) {
-    stderr.write(`${dockerEngineHelp(platform)}\n`);
+    stderr.write(`${dockerEngineHelp(platform, doctorEngine)}\n`);
   }
   return checks.every((check) => check.ok) ? 0 : 1;
 }
@@ -2789,7 +2809,10 @@ function commandNeedsRuntimeFiles(command, args) {
   return false;
 }
 
-function dockerInstallHelp(platform) {
+function dockerInstallHelp(platform, engine = "docker") {
+  if (engine === "podman") {
+    return `Install Podman >= 5 and a Podman Compose provider (such as docker-compose v2), then run "${UNIVERSAL_COMMAND} doctor" again.`;
+  }
   if (platform === "win32") {
     return `Run "${UNIVERSAL_COMMAND} install" to install and start signed Docker Desktop with WSL2 automatically.`;
   }
@@ -2799,7 +2822,13 @@ function dockerInstallHelp(platform) {
   return `Run "${UNIVERSAL_COMMAND} install" to install and start Docker Engine and Compose automatically on supported Linux distributions.`;
 }
 
-function dockerEngineHelp(platform) {
+function dockerEngineHelp(platform, engine = "docker") {
+  if (engine === "podman") {
+    if (platform === "darwin") {
+      return `Run "podman machine init && podman machine start", then run "${UNIVERSAL_COMMAND} doctor" again.`;
+    }
+    return `Verify your rootless Podman setup ("podman info"), then run "${UNIVERSAL_COMMAND} doctor" again.`;
+  }
   if (platform === "win32" || platform === "darwin") {
     return `Open Docker Desktop, complete any first-run prompt, then run "${UNIVERSAL_COMMAND} doctor" again.`;
   }
