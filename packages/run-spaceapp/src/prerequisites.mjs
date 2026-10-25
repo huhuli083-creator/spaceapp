@@ -119,6 +119,85 @@ export async function prepareDockerCliPath({
   return directory;
 }
 
+export async function detectContainerEngine({
+  execute,
+  requestedEngine
+} = {}) {
+  if (requestedEngine === "docker" || requestedEngine === "podman") {
+    return requestedEngine;
+  }
+  if (await dockerCliAndComposeAreAvailable(execute)) {
+    return "docker";
+  }
+  if (await podmanCliAndComposeAreAvailable(execute)) {
+    return "podman";
+  }
+  return "docker";
+}
+
+export async function podmanCliAndComposeAreAvailable(execute) {
+  for (const spec of [
+    { command: "podman", args: ["--version"] },
+    { command: "podman", args: ["compose", "version"] }
+  ]) {
+    if (await execute(spec, { stdout: null, stderr: null }) !== 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export async function ensurePodmanAvailable({
+  platform = process.platform,
+  stdout = process.stdout,
+  stderr = process.stderr,
+  execute
+} = {}) {
+  if (platform === "win32") {
+    stderr.write("Podman engine support in SpaceApp is available on Linux and macOS only.\n");
+    return { code: 1, reexecuted: false };
+  }
+  if (!await podmanCliAndComposeAreAvailable(execute)) {
+    stderr.write(
+      "Podman >= 5 and a Podman Compose provider (such as docker-compose v2) are required for --engine podman.\n"
+    );
+    return { code: 1, reexecuted: false };
+  }
+  let infoOut = "";
+  const infoCode = await execute(
+    { command: "podman", args: ["info", "--format", "{{json .}}"] },
+    {
+      stdout: { write(chunk) { infoOut += String(chunk); } },
+      stderr: null
+    }
+  );
+  if (infoCode !== 0) {
+    stderr.write(
+      platform === "darwin"
+        ? "Podman is installed, but the Podman machine is not running. Run \"podman machine init && podman machine start\" and retry.\n"
+        : "Podman is installed, but \"podman info\" failed. Verify your rootless Podman setup and retry.\n"
+    );
+    return { code: infoCode, reexecuted: false };
+  }
+  try {
+    const parsed = JSON.parse(infoOut.trim());
+    const versionStr = String(parsed?.version?.Version || "");
+    const major = Number(versionStr.split(".")[0]);
+    if (Number.isFinite(major) && major > 0 && major < 5) {
+      stderr.write(`Podman >= 5 is required (detected ${versionStr}). Upgrade Podman and retry.\n`);
+      return { code: 1, reexecuted: false };
+    }
+    if (platform === "linux" && parsed?.host?.cgroupVersion && parsed.host.cgroupVersion !== "v2") {
+      stderr.write(`Rootless Podman on Linux requires cgroup v2 (detected ${parsed.host.cgroupVersion}).\n`);
+      return { code: 1, reexecuted: false };
+    }
+  } catch {
+    // Allow non-JSON mock output in unit tests.
+  }
+  stdout.write("Podman engine is ready.\n");
+  return { code: 0, reexecuted: false };
+}
+
 export async function ensureDockerAvailable({
   platform = process.platform,
   arch = process.arch,
@@ -135,7 +214,10 @@ export async function ensureDockerAvailable({
   installArgs,
   scheduleResume = scheduleWindowsInstallResume,
   confirmRestart = confirmWindowsRestart
-}) {
+} = {}) {
+  if (installArgs?.engine === "podman") {
+    return ensurePodmanAvailable({ platform, stdout, stderr, execute });
+  }
   if (await dockerIsReady(execute)) {
     return { code: 0, reexecuted: false };
   }

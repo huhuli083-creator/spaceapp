@@ -35,6 +35,7 @@ import {
   removeUser,
   removeWorkspace,
   resolveInstallAccessMode,
+  resolveInstallEngine,
   resolveInstallProfile,
   resolveSpaceAppHome,
   saveConfig,
@@ -50,6 +51,7 @@ import {
 } from "./index.mjs";
 import { inspectStoragePlan, storageChecks } from "./storage.mjs";
 import {
+  detectContainerEngine,
   ensureDockerAvailable,
   prepareDockerCliPath,
   windowsPowerShellArgs
@@ -81,6 +83,7 @@ const SETUP_STATUS_TIMEOUT_MS = 10_000;
 const trustedCommands = new Set([
   "codesign",
   "docker",
+  "podman",
   "hdiutil",
   "open",
   "powershell.exe",
@@ -344,7 +347,7 @@ export async function run(argv, {
   if (globalFlags.localImages) {
     const originalExecute = execute;
     execute = async (spec, io) => {
-      if (spec.command === "docker" && spec.args?.includes("compose")) {
+      if ((spec.command === "docker" || spec.command === "podman") && spec.args?.includes("compose")) {
         if (spec.args.at(-1) === "pull") {
           stdout.write("Local images only: skipping registry downloads; missing images will fail startup.\n");
           return 0;
@@ -433,7 +436,7 @@ export async function run(argv, {
 
   if (["up", "down", "status", "logs"].includes(command)) {
     assertNoArgs(args, command);
-    return runtimeExecute(composeCommand(command, root, { profile: config.profile, companionsEnabled: config.companionsEnabled }), { stdin, stdout, stderr });
+    return runtimeExecute(composeCommand(command, root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }), { stdin, stdout, stderr });
   }
   if (command === "open") {
     assertNoArgs(args, "open");
@@ -523,14 +526,14 @@ export async function run(argv, {
     await writeRuntimeFiles(root, rollback);
     const pullCode = await withHeadlessDockerConfig(
       platform,
-      composeCommand("pull", root, { profile: rollback.profile, companionsEnabled: rollback.companionsEnabled }),
+      composeCommand("pull", root, { profile: rollback.profile, companionsEnabled: rollback.companionsEnabled, engine: rollback.engine }),
       (pullSpec) => runtimeExecute(pullSpec, { stdin, stdout, stderr })
     );
     if (pullCode !== 0) {
       await writeRuntimeFiles(root, config);
       return pullCode;
     }
-    const upCode = await runtimeExecute(composeCommand("up", root, { profile: rollback.profile, companionsEnabled: rollback.companionsEnabled }), { stdin, stdout, stderr });
+    const upCode = await runtimeExecute(composeCommand("up", root, { profile: rollback.profile, companionsEnabled: rollback.companionsEnabled, engine: rollback.engine }), { stdin, stdout, stderr });
     if (upCode !== 0) {
       await writeRuntimeFiles(root, config);
       return upCode;
@@ -562,18 +565,18 @@ export async function run(argv, {
     const backupId = await selectLatestBackupId(root);
     const backupCode = await backupWithWritersPaused(runtimeExecute, root, config, { stdin, stdout, stderr });
     if (backupCode !== 0) return backupCode;
-    const stopCode = await runtimeExecute(composeCommand("stopForPortableRestore", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }), { stdin, stdout, stderr });
+    const stopCode = await runtimeExecute(composeCommand("stopForPortableRestore", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }), { stdin, stdout, stderr });
     if (stopCode !== 0) return stopCode;
     // The backup just made holds the data from before the restore.
     const safetyBackupId = await selectLatestBackupId(root).catch(() => "the newest backup");
     const restoreCode = await runtimeExecute(
-      composeCommand("restore", root, { backupId, profile: config.profile }),
+      composeCommand("restore", root, { backupId, profile: config.profile, engine: config.engine }),
       { stdin, stdout, stderr }
     );
     if (restoreCode !== 0) {
       // Exit 3: the restore changed nothing or put every database and file back, so SpaceApp starts again as it was (1.1.8).
       if (restoreCode === RESTORE_UNCHANGED_EXIT) {
-        const againCode = await runtimeExecute(composeCommand("up", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }), { stdin, stdout, stderr });
+        const againCode = await runtimeExecute(composeCommand("up", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }), { stdin, stdout, stderr });
         stderr.write(againCode === 0
           ? `The restore of ${backupId} did not happen; SpaceApp runs again with its data from before the restore (also kept in the backup ${safetyBackupId}).\n`
           : `The restore of ${backupId} did not happen and SpaceApp could not be started again; run "${UNIVERSAL_COMMAND} up". Its data from before the restore is kept in the backup ${safetyBackupId}.\n`);
@@ -582,7 +585,7 @@ export async function run(argv, {
       stderr.write(`The restore of ${backupId} failed and SpaceApp stays stopped: the messages above say what is left at the backup's state. To start SpaceApp anyway, run "${UNIVERSAL_COMMAND} up"; to try again, run "${UNIVERSAL_COMMAND} restore". The data from before the restore is kept in the backup ${safetyBackupId}.\n`);
       return restoreCode;
     }
-    const upCode = await runtimeExecute(composeCommand("up", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }), { stdin, stdout, stderr });
+    const upCode = await runtimeExecute(composeCommand("up", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }), { stdin, stdout, stderr });
     if (upCode !== 0) return upCode;
     await restoreBackupExtras({ root, config, backupId, stdin, stdout, stderr, execute: runtimeExecute })
       .catch((error) => stderr.write(`The data was restored; the CLI settings of the backup were not: ${error.message}\n`));
@@ -600,7 +603,7 @@ export async function run(argv, {
       }
       stdout.write("Stopping and removing SpaceApp containers and network...\n");
       const code = await runtimeExecute(
-        composeCommand("down", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }),
+        composeCommand("down", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }),
         { stdin, stdout, stderr }
       );
       if (code === 0) {
@@ -622,7 +625,7 @@ export async function run(argv, {
       }
       stdout.write("Removing SpaceApp containers, network, and Docker volumes...\n");
       const code = await runtimeExecute(
-        composeCommand("purge", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }),
+        composeCommand("purge", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }),
         { stdin, stdout, stderr }
       );
       if (code === 0) {
@@ -678,16 +681,28 @@ async function installCommand(args, {
   const {
     requestedProfile,
     requestedAccessMode,
+    requestedEngine,
     noOpen,
     companionsEnabled,
     telemetryEnabled,
     installId
   } = wizard;
   const existingConfig = await loadExistingInstallation(root);
+  const resolvedEngine = requestedEngine !== undefined
+    ? resolveInstallEngine(requestedEngine, existingConfig?.engine ?? "docker")
+    : existingConfig?.engine;
+  if (existingConfig && requestedEngine !== undefined && (existingConfig.engine ?? "docker") !== resolvedEngine) {
+    throw new Error(
+      `Cannot switch container engine from ${existingConfig.engine ?? "docker"} to ${resolvedEngine} on an existing installation because container volumes are not visible across engines. Run "${UNIVERSAL_COMMAND} backup", uninstall, and restore on ${resolvedEngine}.`
+    );
+  }
   const accessMode = resolveInstallAccessMode(
     requestedAccessMode,
     existingConfig?.accessMode ?? "isolated"
   );
+  if (accessMode === "host-root" && resolvedEngine === "podman") {
+    throw new Error("Host-root access is not supported on Podman. Use --access isolated.");
+  }
   if (accessMode === "host-root" && platform !== "linux") {
     throw new Error("Host-root access is supported only on Linux.");
   }
@@ -709,7 +724,8 @@ async function installCommand(args, {
     version: runtimeVersion,
     profile,
     accessMode,
-    ...(companionsEnabled ? { companionsEnabled } : {})
+    ...(companionsEnabled ? { companionsEnabled } : {}),
+    ...(resolvedEngine !== undefined ? { engine: resolvedEngine } : {})
   });
   // The stored choice also drives the app's first_answer event after later updates, so an explicit
   // SPACEAPP_TELEMETRY at install time is stored like the answer it overrides (as for the install ping).
@@ -774,7 +790,7 @@ async function installCommand(args, {
     stdout,
     stderr,
     execute,
-    installArgs: { root, requestedProfile, requestedAccessMode, noOpen, autoConfirm: true }
+    installArgs: { root, requestedProfile, requestedAccessMode, engine: result.config.engine, noOpen, autoConfirm: true }
   });
   if (prerequisiteResult.reexecuted) {
     return prerequisiteResult.code;
@@ -859,6 +875,7 @@ async function installCommand(args, {
         profile,
         stateRoot: stagedStateRoot,
         companionsEnabled,
+        engine: result.config.engine,
         ...options
       });
     const pullCode = await withHeadlessDockerConfig(
@@ -1051,7 +1068,7 @@ async function removeInactiveProfileServices({root, config, stateRoot = root, ex
     [settings.temporalEnabled, "removeTemporal", "medium"]
   ]) {
     if (enabled) continue;
-    const code = await execute(composeCommand(action, root, {profile, stateRoot}), {stdin, stdout, stderr});
+    const code = await execute(composeCommand(action, root, {profile, stateRoot, engine: config.engine}), {stdin, stdout, stderr});
     if (code !== 0) {
       stderr.write("Inactive service cleanup failed. Data volumes were preserved. Run doctor --fix.\n");
       return code;
@@ -1168,6 +1185,7 @@ async function planInteractiveSetup({
     return {
       requestedProfile: profileChoice,
       requestedAccessMode: accessChoice,
+      requestedEngine: parsed.requestedEngine ?? stdin?._spaceappPromptController?.answers?.engine,
       noOpen: !openBrowserChoice,
       companionsEnabled: companionsChoice,
       telemetryEnabled: telemetryChoice,
@@ -1245,6 +1263,7 @@ async function planInteractiveSetup({
   return {
     requestedProfile: parsed.requestedProfile,
     requestedAccessMode: parsed.requestedAccessMode,
+    requestedEngine: parsed.requestedEngine ?? stdin?._spaceappPromptController?.answers?.engine,
     noOpen: parsed.noOpen,
     companionsEnabled: parsed.companionsEnabled,
     telemetryEnabled: false
@@ -1318,7 +1337,7 @@ async function repairRuntime({ root, config, platform, stdin, stdout, stderr, ex
     ...plan.actions.map((action) => action.detail)
   ])) return 1;
   const prerequisites = await ensureDocker({platform, arch, env, stdin, stdout, stderr, execute, sleep: sleep || wait,
-    installArgs: {root,requestedProfile:repaired.profile,requestedAccessMode:repaired.accessMode,noOpen:true,autoConfirm:true}});
+    installArgs: {root,requestedProfile:repaired.profile,requestedAccessMode:repaired.accessMode,engine:repaired.engine,noOpen:true,autoConfirm:true}});
   if(prerequisites.reexecuted || prerequisites.code !== 0) return prerequisites.code;
   config = repaired;
   if (await verifyStorage({ root, config, existingConfig: config, operation: "repair", inspectResources, execute, stdout, stderr }) !== 0) return 1;
@@ -1326,7 +1345,7 @@ async function repairRuntime({ root, config, platform, stdin, stdout, stderr, ex
   await writeRuntimeFiles(root, config);
   const pullCode = await withHeadlessDockerConfig(
     platform,
-    composeCommand("pull", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }),
+    composeCommand("pull", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }),
     (pullSpec) => execute(pullSpec, { stdin, stdout, stderr })
   );
   if (pullCode !== 0) {
@@ -1335,7 +1354,7 @@ async function repairRuntime({ root, config, platform, stdin, stdout, stderr, ex
   }
   if (await verifyStorage({ root, config, existingConfig: config, operation: "repair", inspectResources, execute, stdout, stderr }) !== 0) return 1;
   const upCode = await execute(
-    composeCommand("repair", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }),
+    composeCommand("repair", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }),
     { stdin, stdout, stderr }
   );
   if (upCode !== 0) {
@@ -1400,7 +1419,7 @@ async function performUpdate({
     checkpoint = await createQuiescedCheckpoint(root, config, {stdin, stdout, stderr, execute, platform});
     await commitInstallation(root, updated, { persistConfig: false });
     const upCode = await execute(
-      composeCommand("up", root, { profile: updated.profile, companionsEnabled: updated.companionsEnabled }),
+      composeCommand("up", root, { profile: updated.profile, companionsEnabled: updated.companionsEnabled, engine: updated.engine }),
       { stdin, stdout, stderr }
     );
     if (upCode !== 0) {
@@ -1478,7 +1497,7 @@ async function collectFiles(directory, logicalDirectory) {
 // the database, files, memory and Temporal histories are one moment and CLI sessions survive (external review
 // 2026-10-16). Compose skips services that are not running.
 async function backupWithWritersPaused(execute, root, config, io) {
-  const options = { profile: config.profile, companionsEnabled: config.companionsEnabled };
+  const options = { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine };
   io.stdout.write("Pausing SpaceApp writers for the backup; the app and CLI sessions resume afterwards...\n");
   const pauseCode = await execute(composeCommand("pauseWriters", root, options), io);
   if (pauseCode !== 0) return pauseCode;
@@ -1541,7 +1560,7 @@ async function createCheckpoint(root, config, { stdin, stdout, stderr, execute, 
   let dumpCode;
   try {
     dumpCode = await execute(
-      composeCommand("checkpointDump", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }),
+      composeCommand("checkpointDump", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }),
       { stdin: null, stdout: dumpStream, stderr }
     );
   } finally {
@@ -1716,6 +1735,7 @@ async function restoreRuntimeAfterFailedInstall({
 function parseInstallArgs(args) {
   let requestedProfile = "auto";
   let requestedAccessMode;
+  let requestedEngine;
   let noOpen = false;
   let companionsEnabled = false;
   for (let index = 0; index < args.length; index += 1) {
@@ -1746,8 +1766,17 @@ function parseInstallArgs(args) {
       requestedAccessMode = argument.slice("--access=".length);
       continue;
     }
+    if (argument === "--engine" && index + 1 < args.length) {
+      requestedEngine = args[index + 1];
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("--engine=")) {
+      requestedEngine = argument.slice("--engine=".length);
+      continue;
+    }
     throw new Error(
-      `Usage: ${UNIVERSAL_COMMAND} install [--profile auto|small|medium|large|light|standard] [--access isolated|host-root] [--with-companions] [--no-open]`
+      `Usage: ${UNIVERSAL_COMMAND} install [--engine docker|podman] [--profile auto|small|medium|large|light|standard] [--access isolated|host-root] [--with-companions] [--no-open]`
     );
   }
   if (
@@ -1755,13 +1784,17 @@ function parseInstallArgs(args) {
     (
       requestedAccessMode !== undefined &&
       !["isolated", "host-root"].includes(requestedAccessMode)
+    ) ||
+    (
+      requestedEngine !== undefined &&
+      !["docker", "podman"].includes(requestedEngine)
     )
   ) {
     throw new Error(
-      `Usage: ${UNIVERSAL_COMMAND} install [--profile auto|small|medium|large|light|standard] [--access isolated|host-root] [--with-companions] [--no-open]`
+      `Usage: ${UNIVERSAL_COMMAND} install [--engine docker|podman] [--profile auto|small|medium|large|light|standard] [--access isolated|host-root] [--with-companions] [--no-open]`
     );
   }
-  return { requestedProfile, requestedAccessMode, noOpen, companionsEnabled };
+  return { requestedProfile, requestedAccessMode, requestedEngine, noOpen, companionsEnabled };
 }
 
 async function loadExistingInstallation(root) {
@@ -1796,7 +1829,7 @@ async function workspaceCommand(rawArgs, { root, config, platform, stdin, stdout
   const [action, identity, ...rest] = args;
   const applyWorkspaces = async (updated) => {
     // A user's mounts belong to their own container; "up" recreates only the services whose mounts changed.
-    const code = await execute(composeCommand(userId ? "up" : "syncWorkspaces", root, { profile: updated.profile, companionsEnabled: updated.companionsEnabled }), { stdin, stdout, stderr });
+    const code = await execute(composeCommand(userId ? "up" : "syncWorkspaces", root, { profile: updated.profile, companionsEnabled: updated.companionsEnabled, engine: updated.engine }), { stdin, stdout, stderr });
     if (code !== 0) stderr.write(`The change is saved, but the running services could not pick it up. Run "${UNIVERSAL_COMMAND} up".\n`);
     return code;
   };
@@ -1852,7 +1885,7 @@ async function exportArchive(archive, action, { root, config, service, stdin, st
   const out = createWriteStream(archive, { mode: 0o600 });
   await once(out, "open");
   const code = await execute(
-    composeCommand(action, root, { profile: config.profile, companionsEnabled: config.companionsEnabled, service }),
+    composeCommand(action, root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine, service }),
     { stdin, stdout: out, stderr }
   ).catch(() => 1);
   out.end();
@@ -1892,7 +1925,7 @@ async function restoreUserState({ root, config, directory, userId, stdin, stdout
     const input = await readFile(userArchive(directory, userId, kind)).catch(() => null);
     if (!input) continue;
     const code = await execute(
-      composeCommand(action, root, { profile: config.profile, companionsEnabled: config.companionsEnabled, service }),
+      composeCommand(action, root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine, service }),
       { stdin, stdout, stderr, input }
     ).catch(() => 1);
     if (code === 0) restored.push(label);
@@ -1908,7 +1941,7 @@ async function restoreBackupExtras({ root, config, backupId, stdin, stdout, stde
   const archive = await readFile(join(directory, "cli-config.tar.gz")).catch(() => null);
   if (archive) {
     const code = await execute(
-      composeCommand("importCliSettings", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }),
+      composeCommand("importCliSettings", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }),
       { stdin, stdout, stderr, input: archive }
     ).catch(() => 1);
     stdout.write(code === 0 ? "CLI settings (MCP servers, base URLs) restored.\n" : "The CLI settings in this backup could not be restored.\n");
@@ -1955,7 +1988,7 @@ async function credentialsCommand(rawArgs, { root, config, stdin, stdout, stderr
     const value = await readSecret(stdin, stdout, `Enter ${provider} credential: `);
     await writeCredential(root, provider, value, { userId });
     const syncCode = await execute(
-      composeCommand("syncCredentials", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, service }),
+      composeCommand("syncCredentials", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine, service }),
       { stdin, stdout, stderr }
     );
     if (syncCode !== 0) {
@@ -1971,7 +2004,7 @@ async function credentialsCommand(rawArgs, { root, config, stdin, stdout, stderr
     }
     const removed = await removeCredential(root, provider, { userId });
     const syncCode = await execute(
-      composeCommand("syncCredentials", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, service }),
+      composeCommand("syncCredentials", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine, service }),
       { stdin, stdout, stderr }
     );
     if (syncCode !== 0) {
@@ -1997,7 +2030,7 @@ async function waitForUserCli({ root, config, userId, stdin, stdout, stderr, exe
   const service = `spaceapp-cli-${userSlug(userId)}`;
   for (let attempt = 0; attempt < USER_CLI_READY_ATTEMPTS; attempt++) {
     const code = await execute(
-      composeCommand("cliHostReady", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, service }),
+      composeCommand("cliHostReady", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine, service }),
       { stdin, stdout: null, stderr: null }
     ).catch(() => 1);
     if (code === 0) {
@@ -2016,7 +2049,7 @@ async function userCommand(args, { root, config, stdin, stdout, stderr, execute,
     await saveConfig(root, updated);
     await writeRuntimeFiles(root, updated);
     stdout.write(message);
-    const code = await execute(composeCommand("up", root, { profile: updated.profile, companionsEnabled: updated.companionsEnabled }), { stdin, stdout, stderr });
+    const code = await execute(composeCommand("up", root, { profile: updated.profile, companionsEnabled: updated.companionsEnabled, engine: updated.engine }), { stdin, stdout, stderr });
     if (code !== 0) stderr.write(`The change is saved, but the running services could not pick it up. Run "${UNIVERSAL_COMMAND} up".\n`);
     return code;
   };
@@ -2070,13 +2103,13 @@ async function providerCommand(rawArgs, { root, config, stdin, stdout, stderr, e
   stdout.write(`Installing optional provider ${provider} into ${userId ? `the private provider volume of ${userId}` : "this installation's private provider volume"}.\n`);
   // Keep the existing Claude path compatible with older runtime images.
   const action=provider === "claude" ? "installClaude" : "installProvider";
-  return execute(composeCommand(action, root, { profile: config.profile, companionsEnabled: config.companionsEnabled, provider, service }), { stdin, stdout, stderr });
+  return execute(composeCommand(action, root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine, provider, service }), { stdin, stdout, stderr });
 }
 
 async function ownerCommand(args, { root, config, stdin, stdout, stderr, execute }) {
   if (args.length === 1 && args[0] === "rotate-setup-token") {
     const token = randomBytes(32).toString("base64url");
-    const code = await execute(composeCommand("rotateOwnerSetupToken", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }), {
+    const code = await execute(composeCommand("rotateOwnerSetupToken", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }), {
       stdin,
       stdout,
       stderr,
@@ -2097,7 +2130,7 @@ async function ownerCommand(args, { root, config, stdin, stdout, stderr, execute
   if (password.length < 6) {
     throw new Error("Owner password must be at least 6 characters.");
   }
-  return execute(composeCommand("resetOwnerPassword", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }), {
+  return execute(composeCommand("resetOwnerPassword", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }), {
     stdin,
     stdout,
     stderr,
@@ -2125,7 +2158,7 @@ async function reinstallCommand({
     return 0;
   }
   const downCode = await execute(
-    composeCommand("down", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }),
+    composeCommand("down", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }),
     { stdin, stdout, stderr }
   );
   if (downCode !== 0) {
@@ -2133,7 +2166,7 @@ async function reinstallCommand({
   }
   await writeRuntimeFiles(root, config);
   const upCode = await execute(
-    composeCommand("up", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }),
+    composeCommand("up", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }),
     { stdin, stdout, stderr }
   );
   if (upCode !== 0) {
@@ -2265,7 +2298,7 @@ async function factoryResetCommand({
   }
 
   const purgeCode = await execute(
-    composeCommand("purge", root, { profile: config.profile, companionsEnabled: config.companionsEnabled }),
+    composeCommand("purge", root, { profile: config.profile, companionsEnabled: config.companionsEnabled, engine: config.engine }),
     { stdin, stdout, stderr }
   );
   if (purgeCode !== 0) {
@@ -2433,11 +2466,14 @@ async function doctor({
     ...resourceChecks.filter((check) => !storagePlan || check.name !== "Free disk"),
     ...(storagePlan ? storageChecks(storagePlan, detectedResources) : [])
   ];
+  const currentConfig = await loadConfig(root).catch(() => null);
+  const doctorEngine = currentConfig?.engine === "podman" ? "podman" : "docker";
+  const engineLabel = doctorEngine === "podman" ? "Podman" : "Docker";
   const dockerResults = [];
   for (const probe of [
-    { name: "Docker CLI", command: "docker", args: ["--version"] },
-    { name: "Docker Compose", command: "docker", args: ["compose", "version"] },
-    { name: "Docker Engine", command: "docker", args: ["info"] }
+    { name: `${engineLabel} CLI`, command: doctorEngine, args: ["--version"] },
+    { name: `${engineLabel} Compose`, command: doctorEngine, args: ["compose", "version"] },
+    { name: `${engineLabel} Engine`, command: doctorEngine, args: ["info"] }
   ]) {
     const code = dockerReady
       ? 0
@@ -2655,6 +2691,7 @@ function spawnTrustedCommand(spec, options) {
   switch (spec.command) {
     case "codesign": return spawn("codesign", args, options);
     case "docker": return spawn("docker", args, options);
+    case "podman": return spawn("podman", args, options);
     case "hdiutil": return spawn("hdiutil", args, options);
     case "open": return spawn("open", args, options);
     case "powershell.exe":
