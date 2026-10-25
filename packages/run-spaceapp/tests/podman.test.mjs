@@ -13,6 +13,7 @@ import {
   renderWorkspaceCompose,
   resolveInstallEngine,
   saveConfig,
+  userSlug,
   validateConfig
 } from "../src/index.mjs";
 import {
@@ -185,10 +186,18 @@ test("renderWorkspaceCompose adds SELinux relabeling (:z) for podman bind mounts
   };
   const renderedPodman = renderWorkspaceCompose(config);
   assert.match(renderedPodman, /bind:\n\s+selinux: z/);
-
+  assert.ok(renderedPodman.includes("./backups:/backups:z"));
+  assert.ok(renderedPodman.includes("./secrets/providers:/run/spaceapp-secrets/providers:ro,z"));
+  const renderedPodmanMultiUser = renderWorkspaceCompose({
+    ...config,
+    users: [{ id: "user:alice", workspaces: [] }]
+  });
+  assert.ok(renderedPodmanMultiUser.includes("./cli-hosts.json:/etc/spaceapp/cli-hosts.json:ro,z"));
+  assert.ok(renderedPodmanMultiUser.includes(`./secrets/users/${userSlug("user:alice")}/providers:/run/spaceapp-secrets/providers:ro,z`));
   const renderedDocker = renderWorkspaceCompose({ ...config, engine: "docker" });
   assert.doesNotMatch(renderedDocker, /selinux: z/);
-});
+  assert.ok(!renderedDocker.includes(":ro,z"));
+  });
 
 test("prepareInstallation persists engine and refuses switching engines without backup/restore", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "spaceapp-podman-prep-"));
@@ -354,6 +363,9 @@ test("runCli install --engine podman persists engine and runs lifecycle commands
 
     const saved = await loadConfig(root);
     assert.equal(saved.engine, "podman");
+    assert.match(ioInstall.stdoutText, /PASS Podman CLI: available/);
+    assert.match(ioInstall.stdoutText, /PASS Podman Compose: available/);
+    assert.match(ioInstall.stdoutText, /PASS Podman Engine: available/);
     assert.ok(executed.some((cmd) => cmd.startsWith("podman compose ")));
     assert.ok(!executed.some((cmd) => cmd.startsWith("docker ")));
 
@@ -370,6 +382,50 @@ test("runCli install --engine podman persists engine and runs lifecycle commands
     assert.equal(statusCode, 0);
     assert.equal(executed.length, 1);
     assert.match(executed[0], /^podman compose /);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runCli install --engine auto and SPACEAPP_CONTAINER_ENGINE select podman when docker is absent", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "spaceapp-podman-auto-"));
+  try {
+    const execute = async (spec, io) => {
+      if (spec.command === "docker") return 127;
+      if (spec.command === "podman" && spec.args?.[0] === "info") {
+        io?.stdout?.write(JSON.stringify({
+          version: { Version: "5.3.0" },
+          host: { cgroupVersion: "v2", cpus: 8, memTotal: 17179869184 },
+          store: { graphRoot: root }
+        }));
+      }
+      return 0;
+    };
+
+    const ioInstall = createIo();
+    const code = await run(["install", "--engine", "auto", "--profile", "light", "--no-open"], {
+      env: { SPACEAPP_HOME: root },
+      platform: "linux",
+      stdin: ttyStdin("", "", "", "", "", "y"),
+      stdout: ioInstall.stdout,
+      stderr: ioInstall.stderr,
+      execute,
+      prepareDockerPath: async () => null,
+      inspectResources: async () => ({
+        cpuCount: 8,
+        totalMemoryBytes: 16 * 1024 ** 3,
+        freeDiskBytes: 50 * 1024 ** 3
+      }),
+      request: async (url) => {
+        if (url.endsWith("/readyz")) {
+          return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ setupRequired: true, expiresAt: "2099-01-01T00:00:00.000Z" }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+    });
+    assert.equal(code, 0, `STDERR: ${ioInstall.stderrText}\nSTDOUT: ${ioInstall.stdoutText}`);
+    const saved = await loadConfig(root);
+    assert.equal(saved.engine, "podman");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
