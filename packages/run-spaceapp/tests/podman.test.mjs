@@ -126,10 +126,16 @@ test("resolveInstallEngine accepts docker and podman and defaults to docker", ()
   assert.throws(() => resolveInstallEngine("containerd"), /Install engine must be docker or podman/);
 });
 
-test("detectContainerEngine prefers explicit flag, then docker, then podman", async () => {
+test("detectContainerEngine prefers explicit flag, then reachable docker daemon, then podman", async () => {
   const podmanOnlyExec = async (spec) => (spec.command === "podman" ? 0 : 127);
   assert.equal(await detectContainerEngine({ execute: podmanOnlyExec }), "podman");
   assert.equal(await detectContainerEngine({ execute: podmanOnlyExec, requestedEngine: "docker" }), "docker");
+
+  const dockerDaemonDownExec = async (spec) => {
+    if (spec.command === "docker" && spec.args?.[0] === "info") return 1;
+    return 0;
+  };
+  assert.equal(await detectContainerEngine({ execute: dockerDaemonDownExec }), "podman");
 
   const bothExec = async () => 0;
   assert.equal(await detectContainerEngine({ execute: bothExec }), "docker");
@@ -426,6 +432,89 @@ test("runCli install --engine auto and SPACEAPP_CONTAINER_ENGINE select podman w
     assert.equal(code, 0, `STDERR: ${ioInstall.stderrText}\nSTDOUT: ${ioInstall.stdoutText}`);
     const saved = await loadConfig(root);
     assert.equal(saved.engine, "podman");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("doctor, support-bundle, factory-reset, and same-version install preserve and report podman engine", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "spaceapp-podman-maint-"));
+  try {
+    const prepared = await prepareInstallation(root, {
+      version: "1.1.12",
+      profile: "light",
+      accessMode: "isolated",
+      engine: "podman"
+    });
+    await saveConfig(root, prepared.config);
+
+    // 1. Same-version install with --engine docker must reject switching engines before repair prompt
+    const ioSwitch = createIo();
+    await assert.rejects(
+      () =>
+        run(["install", "--engine", "docker"], {
+          env: { SPACEAPP_HOME: root },
+          platform: "linux",
+          stdin: ttyStdin("3"),
+          stdout: ioSwitch.stdout,
+          stderr: ioSwitch.stderr,
+          execute: async () => 0,
+          inspectResources: async () => ({
+            cpuCount: 8,
+            totalMemoryBytes: 16 * 1024 ** 3,
+            freeDiskBytes: 50 * 1024 ** 3
+          })
+        }),
+      /Cannot switch container engine from podman to docker on an existing installation/
+    );
+
+    // 2. Doctor on macOS when podman info fails prints Podman-specific guidance
+    const ioDoctor = createIo();
+    const docCode = await run(["doctor"], {
+      env: { SPACEAPP_HOME: root },
+      platform: "darwin",
+      stdin: ioDoctor.stdin,
+      stdout: ioDoctor.stdout,
+      stderr: ioDoctor.stderr,
+      execute: async (spec) => (spec.command === "podman" && spec.args?.[0] === "info" ? 125 : 0),
+      inspectResources: async () => ({
+        cpuCount: 8,
+        totalMemoryBytes: 16 * 1024 ** 3,
+        freeDiskBytes: 50 * 1024 ** 3
+      })
+    });
+    assert.equal(docCode, 1);
+    assert.match(ioDoctor.stderrText, /podman machine init && podman machine start/);
+
+    // 3. Support bundle includes engine: "podman"
+    const bundlePath = path.join(root, "bundle.json");
+    const ioBundle = createIo();
+    const bundleCode = await run(["support-bundle", "--out", bundlePath], {
+      env: { SPACEAPP_HOME: root },
+      platform: "linux",
+      stdin: ioBundle.stdin,
+      stdout: ioBundle.stdout,
+      stderr: ioBundle.stderr,
+      execute: async () => 0
+    });
+    assert.equal(bundleCode, 0);
+    const { readFile } = await import("node:fs/promises");
+    const bundle = JSON.parse(await readFile(bundlePath, "utf8"));
+    assert.equal(bundle.installation.config.engine, "podman");
+
+    // 4. Factory reset retains engine: "podman"
+    const ioReset = createIo();
+    const resetCode = await run(["factory-reset"], {
+      env: { SPACEAPP_HOME: root },
+      platform: "linux",
+      stdin: ttyStdin("FACTORY-RESET", "y"),
+      stdout: ioReset.stdout,
+      stderr: ioReset.stderr,
+      execute: async () => 0
+    });
+    assert.equal(resetCode, 0, `STDERR: ${ioReset.stderrText}\nSTDOUT: ${ioReset.stdoutText}`);
+    const afterReset = await loadConfig(root);
+    assert.equal(afterReset.engine, "podman");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
