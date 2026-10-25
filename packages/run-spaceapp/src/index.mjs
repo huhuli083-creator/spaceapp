@@ -697,7 +697,9 @@ const CLI_SANDBOX_OPTIONS = ["    security_opt:", "      - seccomp=./seccomp-cli
 
 export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
   validateConfig(config);
-  const podmanBind = config.engine === "podman" ? ["        bind:", "          selinux: z"] : [];
+  const isPodman = config.engine === "podman";
+  const podmanBind = isPodman ? ["        bind:", "          selinux: z"] : [];
+  const roBindSuffix = isPodman ? ":ro,z" : ":ro";
   const mounts = config.workspaces.flatMap((workspace) => [
     "      - type: bind",
     `        source: ${JSON.stringify(workspace.hostPath)}`,
@@ -705,11 +707,18 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
     `        read_only: ${workspace.readOnly}`,
     ...podmanBind
   ]);
-  const service = mounts.length > 0
-    ? ["    volumes:", ...mounts]
+  const coreMounts = isPodman ? ["      - ./backups:/backups:z", ...mounts] : mounts;
+  const cliMounts = isPodman
+    ? ["      - ./secrets/providers:/run/spaceapp-secrets/providers:ro,z", ...mounts]
+    : mounts;
+  const coreService = coreMounts.length > 0
+    ? ["    volumes:", ...coreMounts]
+    : ["    volumes: []"];
+  const cliService = cliMounts.length > 0
+    ? ["    volumes:", ...cliMounts]
     : ["    volumes: []"];
   if (config.users === undefined) {
-    return ["services:", "  spaceapp-core:", ...service, "  spaceapp-cli:", ...service, ...(cliSandbox ? CLI_SANDBOX_OPTIONS : []), ""].join("\n");
+    return ["services:", "  spaceapp-core:", ...coreService, "  spaceapp-cli:", ...cliService, ...(cliSandbox ? CLI_SANDBOX_OPTIONS : []), ""].join("\n");
   }
   // "user enable": accounts are on, and the core starts a USER's CLIs only in that user's own container.
   const users = config.users;
@@ -743,7 +752,7 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
       `      - spaceapp-memory-${slug}:/var/lib/spaceapp/memory`,
       `      - spaceapp-cli-socket-${slug}:/run/spaceapp-cli`,
       `      - spaceapp-workspaces-${slug}:/workspaces`,
-      `      - ./secrets/users/${slug}/providers:/run/spaceapp-secrets/providers:ro`,
+      `      - ./secrets/users/${slug}/providers:/run/spaceapp-secrets/providers${roBindSuffix}`,
       ...user.workspaces.flatMap(bind),
       // Its own network: internet only, never the owner's internal services (temporal, companions) or other users.
       "    networks:",
@@ -757,11 +766,11 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
     '      SPACE_MULTI_USER_ENABLED: "true"',
     "      SPACE_CLI_HOST_SOCKETS_FILE: /etc/spaceapp/cli-hosts.json",
     "    volumes:",
-    ...(mounts.length > 0 ? mounts : []),
-    "      - ./cli-hosts.json:/etc/spaceapp/cli-hosts.json:ro",
+    ...(coreMounts.length > 0 ? coreMounts : []),
+    `      - ./cli-hosts.json:/etc/spaceapp/cli-hosts.json${roBindSuffix}`,
     ...users.map((user) => `      - spaceapp-cli-socket-${userSlug(user.id)}:/run/spaceapp-cli-users/${userSlug(user.id)}`),
     "  spaceapp-cli:",
-    ...service,
+    ...cliService,
     ...(cliSandbox ? CLI_SANDBOX_OPTIONS : []),
     ...userServices,
     ...(users.length > 0 ? ["volumes:"] : []),

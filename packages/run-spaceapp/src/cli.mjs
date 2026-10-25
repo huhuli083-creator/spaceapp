@@ -688,10 +688,17 @@ async function installCommand(args, {
     installId
   } = wizard;
   const existingConfig = await loadExistingInstallation(root);
-  const resolvedEngine = requestedEngine !== undefined
-    ? resolveInstallEngine(requestedEngine, existingConfig?.engine ?? "docker")
-    : existingConfig?.engine;
-  if (existingConfig && requestedEngine !== undefined && (existingConfig.engine ?? "docker") !== resolvedEngine) {
+  const effectiveRequestedEngine = requestedEngine ?? (env?.SPACEAPP_CONTAINER_ENGINE || undefined);
+  let resolvedEngine = existingConfig?.engine;
+  if (effectiveRequestedEngine !== undefined && effectiveRequestedEngine !== "auto") {
+    resolvedEngine = resolveInstallEngine(effectiveRequestedEngine, existingConfig?.engine ?? "docker");
+  }
+  if (
+    existingConfig &&
+    effectiveRequestedEngine !== undefined &&
+    effectiveRequestedEngine !== "auto" &&
+    (existingConfig.engine ?? "docker") !== resolvedEngine
+  ) {
     throw new Error(
       `Cannot switch container engine from ${existingConfig.engine ?? "docker"} to ${resolvedEngine} on an existing installation because container volumes are not visible across engines. Run "${UNIVERSAL_COMMAND} backup", uninstall, and restore on ${resolvedEngine}.`
     );
@@ -712,6 +719,12 @@ async function installCommand(args, {
     );
   }
   await prepareDockerPath({ platform, env });
+  if (effectiveRequestedEngine === "auto") {
+    resolvedEngine = existingConfig?.engine ?? await detectContainerEngine({ execute, requestedEngine: "auto", env });
+    if (accessMode === "host-root" && resolvedEngine === "podman") {
+      throw new Error("Host-root access is not supported on Podman. Use --access isolated.");
+    }
+  }
   const resources = await inspectResources(root);
   let profile = requestedProfile === "auto" && existingConfig
     ? existingConfig.profile : resolveInstallProfile(requestedProfile, resources);
@@ -773,7 +786,9 @@ async function installCommand(args, {
       stdin,
       inspectResources,
       resources,
-      profile, operation
+      profile,
+      engine: result.config.engine,
+      operation
     });
     stderr.write(
       `Installation stopped before downloading images. Fix the failed checks and run "${UNIVERSAL_COMMAND} install" again.\n`
@@ -824,6 +839,7 @@ async function installCommand(args, {
     inspectResources,
     resources,
     profile,
+    engine: result.config.engine,
     dockerReady: true, operation, storagePlan
   });
   if (doctorCode !== 0) {
@@ -842,6 +858,7 @@ async function installCommand(args, {
         root,
         stateRoot: stagedStateRoot,
         profile,
+        engine: result.config.engine,
         platform,
         stdin,
         stdout,
@@ -856,6 +873,7 @@ async function installCommand(args, {
         stagedStateRoot,
         existingConfig,
         attemptedProfile: profile,
+        engine: result.config.engine,
         companionsEnabled,
         platform,
         stdin,
@@ -1642,6 +1660,7 @@ async function reportInstallDiagnostics({
   root,
   stateRoot,
   profile,
+  engine,
   platform,
   stdin,
   stdout,
@@ -1656,6 +1675,7 @@ async function reportInstallDiagnostics({
         composeCommand(action, root, {
           profile,
           stateRoot,
+          engine,
           lines: 200
         }),
         { stdin, stdout, stderr },
@@ -1679,6 +1699,7 @@ async function restoreRuntimeAfterFailedInstall({
   stagedStateRoot,
   existingConfig,
   attemptedProfile,
+  engine,
   companionsEnabled,
   platform,
   stdin,
@@ -1698,6 +1719,7 @@ async function restoreRuntimeAfterFailedInstall({
       const restoreCode = await runtimeExecute(
         composeCommand("up", root, {
           profile: existingConfig.profile,
+          engine: existingConfig.engine,
           companionsEnabled: existingConfig.companionsEnabled
         })
       );
@@ -1717,6 +1739,7 @@ async function restoreRuntimeAfterFailedInstall({
       composeCommand("down", root, {
         profile: existingConfig?.profile ?? attemptedProfile,
         stateRoot: existingConfig ? root : stagedStateRoot,
+        engine: existingConfig?.engine ?? engine,
         companionsEnabled: existingConfig?.companionsEnabled ?? companionsEnabled
       })
     );
@@ -1776,7 +1799,7 @@ function parseInstallArgs(args) {
       continue;
     }
     throw new Error(
-      `Usage: ${UNIVERSAL_COMMAND} install [--engine docker|podman] [--profile auto|small|medium|large|light|standard] [--access isolated|host-root] [--with-companions] [--no-open]`
+      `Usage: ${UNIVERSAL_COMMAND} install [--engine auto|docker|podman] [--profile auto|small|medium|large|light|standard] [--access isolated|host-root] [--with-companions] [--no-open]`
     );
   }
   if (
@@ -1787,11 +1810,11 @@ function parseInstallArgs(args) {
     ) ||
     (
       requestedEngine !== undefined &&
-      !["docker", "podman"].includes(requestedEngine)
+      !["auto", "docker", "podman"].includes(requestedEngine)
     )
   ) {
     throw new Error(
-      `Usage: ${UNIVERSAL_COMMAND} install [--engine docker|podman] [--profile auto|small|medium|large|light|standard] [--access isolated|host-root] [--with-companions] [--no-open]`
+      `Usage: ${UNIVERSAL_COMMAND} install [--engine auto|docker|podman] [--profile auto|small|medium|large|light|standard] [--access isolated|host-root] [--with-companions] [--no-open]`
     );
   }
   return { requestedProfile, requestedAccessMode, requestedEngine, noOpen, companionsEnabled };
@@ -2395,12 +2418,12 @@ async function updateCommand(args, { root, config, version, platform, stdin, std
     }
   }
   const prerequisites = await ensureDocker({ platform, arch, env, stdin, stdout, stderr, execute,
-    installArgs: { root, requestedProfile: config.profile, noOpen: true, autoConfirm: true } });
+    installArgs: { root, requestedProfile: config.profile, engine: config.engine, noOpen: true, autoConfirm: true } });
   if (prerequisites.reexecuted || prerequisites.code !== 0) return prerequisites.code;
   const resources = await inspectResources(root);
   const storagePlan = await inspectStoragePlan({ root, config: { ...config, version: targetVersion }, existingConfig: config, resources, execute, operation: "upgrade" });
   if (await doctor({ root, platform, stdout, stderr, execute, stdin, inspectResources, resources,
-    profile: config.profile, dockerReady: true, operation: "upgrade", storagePlan }) !== 0) return 1;
+    profile: config.profile, engine: config.engine, dockerReady: true, operation: "upgrade", storagePlan }) !== 0) return 1;
   return performUpdate({
     root,
     config,
@@ -2439,6 +2462,7 @@ async function doctor({
   inspectResources,
   resources,
   profile,
+  engine,
   operation,
   storagePlan,
   dockerReady = false
@@ -2467,7 +2491,7 @@ async function doctor({
     ...(storagePlan ? storageChecks(storagePlan, detectedResources) : [])
   ];
   const currentConfig = await loadConfig(root).catch(() => null);
-  const doctorEngine = currentConfig?.engine === "podman" ? "podman" : "docker";
+  const doctorEngine = (engine ?? currentConfig?.engine) === "podman" ? "podman" : "docker";
   const engineLabel = doctorEngine === "podman" ? "Podman" : "Docker";
   const dockerResults = [];
   for (const probe of [
@@ -2496,7 +2520,7 @@ async function doctor({
     detail: dockerCompose.code === 0
       ? "available"
       : dockerCli.code !== 0
-        ? "not available because Docker CLI is missing"
+        ? `not available because ${engineLabel} CLI is missing`
         : `plugin unavailable (exit ${dockerCompose.code})`
   });
   checks.push({
@@ -2506,7 +2530,7 @@ async function doctor({
       ? "available"
       : dockerCli.code === 0
         ? "installed but not running or inaccessible"
-        : "not reachable because Docker CLI is missing"
+        : `not reachable because ${engineLabel} CLI is missing`
   });
   for (const check of checks) {
     (check.ok ? stdout : stderr).write(`${check.ok ? "PASS" : "FAIL"} ${check.name}: ${check.detail}\n`);

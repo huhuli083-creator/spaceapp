@@ -121,10 +121,12 @@ export async function prepareDockerCliPath({
 
 export async function detectContainerEngine({
   execute,
-  requestedEngine
+  requestedEngine,
+  env = process.env
 } = {}) {
-  if (requestedEngine === "docker" || requestedEngine === "podman") {
-    return requestedEngine;
+  const candidate = requestedEngine ?? env?.SPACEAPP_CONTAINER_ENGINE;
+  if (candidate === "docker" || candidate === "podman") {
+    return candidate;
   }
   if (await dockerCliAndComposeAreAvailable(execute)) {
     return "docker";
